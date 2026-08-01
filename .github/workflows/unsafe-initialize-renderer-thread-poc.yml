@@ -145,7 +145,7 @@ jobs:
           fi
 
           grep -F 'can only access NSView on the main thread' "$LOG"
-          grep -F 'raw_window_metal::Layer::from_ns_view' "$LOG"
+          grep -F '<raw_window_metal::Layer>::from_ns_view' "$LOG"
           grep -F 'bevy_render::renderer::initialize_renderer' "$LOG"
 
           echo "Confirmed: safe initialize_renderer use caused the Metal/AppKit main-thread check to panic."
