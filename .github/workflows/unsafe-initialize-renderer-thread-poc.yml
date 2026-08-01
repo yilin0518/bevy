@@ -1,0 +1,158 @@
+name: Unsafe initialize_renderer thread PoC
+
+# This is an audit harness, not normal project CI. Keep it manually triggered:
+# it intentionally invokes a public API from a worker thread to demonstrate
+# whether a macOS main-thread-only window handle reaches wgpu there.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-main-thread-contract:
+    name: Verify AppKit handle use from a worker
+    runs-on: macos-14
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 1
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: stable
+
+      - name: Create isolated PoC crate
+        shell: bash
+        run: |
+          set -euo pipefail
+          POC_DIR="$RUNNER_TEMP/bevy-initialize-renderer-thread-poc"
+          mkdir -p "$POC_DIR/src"
+
+          cat > "$POC_DIR/Cargo.toml" <<EOF
+          [package]
+          name = "bevy-initialize-renderer-thread-poc"
+          version = "0.1.0"
+          edition = "2024"
+          publish = false
+
+          [dependencies]
+          bevy_render = { path = "${GITHUB_WORKSPACE}/crates/bevy_render" }
+          bevy_window = { path = "${GITHUB_WORKSPACE}/crates/bevy_window" }
+          bevy_platform = { path = "${GITHUB_WORKSPACE}/crates/bevy_platform" }
+          bevy_tasks = { path = "${GITHUB_WORKSPACE}/crates/bevy_tasks" }
+          winit = "0.30.13"
+          EOF
+
+          cat > "$POC_DIR/src/lib.rs" <<'EOF'
+          use bevy_platform::sync::Mutex;
+          use bevy_render::{
+              renderer::initialize_renderer,
+              settings::{Backends, WgpuSettings},
+          };
+          use bevy_window::RawHandleWrapperHolder;
+          use std::sync::Arc;
+
+          fn assert_send<T: Send>() {}
+
+          #[test]
+          fn public_initializer_and_handle_holder_are_send() {
+              assert_send::<RawHandleWrapperHolder>();
+              let holder = RawHandleWrapperHolder(Arc::new(Mutex::new(None)));
+              let settings = WgpuSettings::default();
+              assert_send_value(initialize_renderer(Backends::empty(), Some(holder), &settings));
+          }
+
+          fn assert_send_value<T: Send>(_: T) {}
+          EOF
+
+          cat > "$POC_DIR/src/main.rs" <<'EOF'
+          use std::{sync::Arc, thread};
+
+          use bevy_platform::sync::Mutex;
+          use bevy_render::{
+              renderer::initialize_renderer,
+              settings::{Backends, WgpuSettings},
+          };
+          use bevy_window::{RawHandleWrapper, RawHandleWrapperHolder, WindowWrapper};
+          use winit::{event_loop::EventLoop, window::Window};
+
+          fn main() {
+              // On macOS, this must be the process main thread.
+              let event_loop = EventLoop::new().expect("create event loop on main thread");
+              let window = event_loop
+                  .create_window(Window::default_attributes().with_title(
+                      "Bevy initialize_renderer main-thread PoC",
+                  ))
+                  .expect("create main-thread window");
+
+              // The application performs no unsafe operation. The wrapper keeps the
+              // native window alive while the safe public renderer API is invoked.
+              let window = WindowWrapper::new(window);
+              let raw_handle = RawHandleWrapper::new(&window).expect("obtain raw handles");
+              let holder = RawHandleWrapperHolder(Arc::new(Mutex::new(Some(raw_handle))));
+              let settings = WgpuSettings::default();
+
+              thread::spawn(move || {
+                  // The first poll enters initialize_renderer on this worker and reaches
+                  // RawHandleWrapper::get_handle before wgpu::Instance::create_surface.
+                  let _renderer = bevy_tasks::block_on(initialize_renderer(
+                      Backends::all(),
+                      Some(holder),
+                      &settings,
+                  ));
+              })
+              .join()
+              .expect("worker thread panicked");
+          }
+          EOF
+
+          echo "POC_DIR=$POC_DIR" >> "$GITHUB_ENV"
+
+      - name: Prove the safe API can cross the thread boundary
+        run: cargo test --manifest-path "$POC_DIR/Cargo.toml" --lib
+
+      - name: Build the macOS runtime PoC with debug information
+        run: cargo build --manifest-path "$POC_DIR/Cargo.toml"
+
+      - name: Verify the raw AppKit handle is reached on a worker
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOG="$RUNNER_TEMP/initialize-renderer-thread-poc-lldb.log"
+
+          # `create_surface` synchronously calls HasWindowHandle::window_handle.
+          # Line 148 is the unsafe WindowHandle::borrow_raw call in Bevy's
+          # ThreadLockedRawWindowHandleWrapper implementation. At this breakpoint
+          # `pthread_main_np() == 0` means the handle is being exposed off-main-thread.
+          set +e
+          lldb --batch \
+            -o 'breakpoint set --file raw_handle.rs --line 148' \
+            -o run \
+            -o 'expr -- (int)pthread_main_np()' \
+            -o 'thread backtrace all' \
+            -o 'process kill' \
+            -- "$POC_DIR/target/debug/bevy-initialize-renderer-thread-poc" \
+            2>&1 | tee "$LOG"
+          LLDB_STATUS=${PIPESTATUS[0]}
+          set -e
+
+          grep -F 'raw_handle.rs:148' "$LOG"
+          grep -F 'stop reason = breakpoint' "$LOG"
+          grep -Eq '\(int\) \$[0-9]+ = 0' "$LOG"
+
+          echo "Confirmed: the macOS main-thread predicate was false at Bevy's raw-handle conversion."
+          echo "lldb exit status after the intentional process kill: $LLDB_STATUS"
+
+      - name: Upload LLDB evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: initialize-renderer-thread-poc-lldb
+          path: ${{ runner.temp }}/initialize-renderer-thread-poc-lldb.log
+          if-no-files-found: warn
