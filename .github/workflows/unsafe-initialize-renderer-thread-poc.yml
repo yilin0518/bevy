@@ -1,10 +1,13 @@
 name: Unsafe initialize_renderer thread PoC
 
-# This is an audit harness, not normal project CI. Keep it manually triggered:
-# it intentionally invokes a public API from a worker thread to demonstrate
-# whether a macOS main-thread-only window handle reaches wgpu there.
+# This is an audit harness, not normal project CI. The branch-specific push
+# trigger starts the initial verification run without requiring an API token;
+# subsequent runs can be started manually.
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - audit/initialize-renderer-thread-poc
 
 permissions:
   contents: read
