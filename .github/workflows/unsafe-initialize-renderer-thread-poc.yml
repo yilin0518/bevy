@@ -1,10 +1,13 @@
 name: Unsafe initialize_renderer thread PoC
 
-# This is an audit harness, not normal project CI. Keep it manually triggered:
-# it intentionally invokes a public API from a worker thread to demonstrate
-# whether a macOS main-thread-only window handle reaches wgpu there.
+# This is an audit harness, not normal project CI. The branch-specific push
+# trigger starts this verification run without requiring an API token;
+# subsequent runs can be started manually.
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - audit/initialize-renderer-thread-poc
 
 permissions:
   contents: read
@@ -120,6 +123,33 @@ jobs:
       - name: Build the macOS runtime PoC with debug information
         run: cargo build --manifest-path "$POC_DIR/Cargo.toml"
 
+      - name: Demonstrate the main-thread violation as an observable panic
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOG="$RUNNER_TEMP/initialize-renderer-thread-poc-runtime.log"
+
+          # wgpu's Metal backend calls raw_window_metal::Layer::from_ns_view.
+          # That constructor requires objc2::MainThreadMarker and deterministically
+          # panics with the message below when initialize_renderer runs on this
+          # worker thread. The PoC itself contains no Rust unsafe code.
+          set +e
+          RUST_BACKTRACE=1 "$POC_DIR/target/debug/bevy-initialize-renderer-thread-poc" \
+            2>&1 | tee "$LOG"
+          PROGRAM_STATUS=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$PROGRAM_STATUS" -eq 0 ]; then
+            echo "PoC unexpectedly completed without the required main-thread panic." >&2
+            exit 1
+          fi
+
+          grep -F 'can only access NSView on the main thread' "$LOG"
+          grep -F 'raw_window_metal::Layer::from_ns_view' "$LOG"
+          grep -F 'bevy_render::renderer::initialize_renderer' "$LOG"
+
+          echo "Confirmed: safe initialize_renderer use caused the Metal/AppKit main-thread check to panic."
+
       - name: Verify the raw AppKit handle is reached on a worker
         shell: bash
         run: |
@@ -154,5 +184,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: initialize-renderer-thread-poc-lldb
-          path: ${{ runner.temp }}/initialize-renderer-thread-poc-lldb.log
+          path: |
+            ${{ runner.temp }}/initialize-renderer-thread-poc-lldb.log
+            ${{ runner.temp }}/initialize-renderer-thread-poc-runtime.log
           if-no-files-found: warn
